@@ -7,6 +7,7 @@
 
 #include <zephyr.h>
 #include <init.h>
+#include <drivers/gpio.h>
 
 #include <usb/usb_device.h>
 #include <usb/class/usb_hid.h>
@@ -16,23 +17,26 @@ LOG_MODULE_REGISTER(main);
 
 static bool configured;
 static const struct device *hdev;
-static struct k_work report_send;
 static ATOMIC_DEFINE(hid_ep_in_busy, 1);
 
 #define HID_EP_BUSY_FLAG	0
-#define REPORT_ID_1		0x01
-#define REPORT_PERIOD		K_SECONDS(2)
 
-static struct report {
-	uint8_t id;
-	uint8_t value;
-} __packed report_1 = {
-	.id = REPORT_ID_1,
-	.value = 0,
+static struct joystick_report {
+	uint16_t button;
+	uint8_t hat;
+	uint8_t lx;
+	uint8_t ly;
+	uint8_t rx;
+	uint8_t ry;
+    uint8_t vendor_specific;
+} report = {
+    .button = 0,
+    .hat = 0x08,
+    .lx = 128,
+    .ly = 128,
+    .rx = 128,
+    .ry = 128,
 };
-
-static void report_event_handler(struct k_timer *dummy);
-static K_TIMER_DEFINE(event_timer, report_event_handler, NULL);
 
 /*
  * Simple HID Report Descriptor
@@ -43,18 +47,49 @@ static K_TIMER_DEFINE(event_timer, report_event_handler, NULL);
  */
 static const uint8_t hid_report_desc[] = {
 	HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
-	HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
+	HID_USAGE(HID_USAGE_GEN_DESKTOP_GAMEPAD),
 	HID_COLLECTION(HID_COLLECTION_APPLICATION),
-	HID_LOGICAL_MIN8(0x00),
-	HID_LOGICAL_MAX16(0xFF, 0x00),
-	HID_REPORT_ID(REPORT_ID_1),
-	HID_REPORT_SIZE(8),
-	HID_REPORT_COUNT(1),
-	HID_USAGE(HID_USAGE_GEN_DESKTOP_UNDEFINED),
-	HID_INPUT(0x02),
+        HID_LOGICAL_MIN8(0x00),
+        HID_LOGICAL_MAX8(0x01),
+        0x35, 0x00, // Physical Minimum (0)
+        0x45, 0x01, // Physical Maximum (1)
+        HID_REPORT_SIZE(1),
+        HID_REPORT_COUNT(16),
+        HID_USAGE_PAGE(HID_USAGE_GEN_BUTTON),
+        HID_USAGE_MIN8(1),
+        HID_USAGE_MAX8(0x10),
+        HID_INPUT(0x02), // Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
+        HID_LOGICAL_MAX8(0x07),
+        0x46, 0x3B, 0x01,  //   Physical Maximum (315)
+        HID_REPORT_SIZE(4),
+        HID_REPORT_COUNT(1),
+        0x65, 0x14,        //   Unit (System: English Rotation, Length: Centimeter)
+        0x09, 0x39,        //   Usage (Hat switch)
+        0x81, 0x42,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,Null State)
+        0x65, 0x00,        //   Unit (None)
+        HID_REPORT_COUNT(1),
+        0x81, 0x01,        //   Input (Const,Array,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        HID_LOGICAL_MAX16(0xFF, 0x00),  //   Logical Maximum (255)
+        0x46, 0xFF, 0x00,  //   Physical Maximum (255)
+        0x09, 0x30,        //   Usage (X)
+        0x09, 0x31,        //   Usage (Y)
+        0x09, 0x32,        //   Usage (Z)
+        0x09, 0x35,        //   Usage (Rz)
+        HID_REPORT_SIZE(8),
+        HID_REPORT_COUNT(4),
+        0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0x06, 0x00, 0xFF,  //   Usage Page (Vendor Defined 0xFF00)
+        0x09, 0x20,        //   Usage (0x20)
+        HID_REPORT_COUNT(1),
+        0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+        0x0A, 0x21, 0x26,  //   Usage (0x2621)
+        HID_REPORT_COUNT(8),
+        0x91, 0x02,        //   Output (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile)
 	HID_END_COLLECTION,
 };
 
+/*
 static void send_report(struct k_work *work)
 {
 	int ret, wrote;
@@ -67,6 +102,7 @@ static void send_report(struct k_work *work)
 			 * Do nothing and wait until host has reset the device
 			 * and hid_ep_in_busy is cleared.
 			 */
+/*
 			LOG_ERR("Failed to submit report");
 		} else {
 			LOG_DBG("Report submitted");
@@ -75,6 +111,7 @@ static void send_report(struct k_work *work)
 		LOG_DBG("HID IN endpoint busy");
 	}
 }
+*/
 
 static void int_in_ready_cb(const struct device *dev)
 {
@@ -92,14 +129,6 @@ static void int_in_ready_cb(const struct device *dev)
 static void on_idle_cb(const struct device *dev, uint16_t report_id)
 {
 	LOG_DBG("On idle callback");
-	k_work_submit(&report_send);
-}
-
-static void report_event_handler(struct k_timer *dummy)
-{
-	/* Increment reported data */
-	report_1.value++;
-	k_work_submit(&report_send);
 }
 
 static void protocol_cb(const struct device *dev, uint8_t protocol)
@@ -146,7 +175,50 @@ void main(void)
 		return;
 	}
 
-	k_work_init(&report_send, send_report);
+    static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+    if (!device_is_ready(button.port)) {
+        LOG_ERR("button gpio port is not ready\n");
+        return;
+    }
+    ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
+    if (ret != 0) {
+        LOG_ERR("Failed to configure btn as input\n");
+        return;
+    }
+
+    static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+    if (!device_is_ready(led.port)) {
+        LOG_ERR("led gpio port is not ready\n");
+        return;
+    }
+    ret = gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
+    if (ret != 0) {
+        LOG_ERR("Failed to configure led as output\n");
+        return;
+    }
+
+    int val = 0;
+    int wrote;
+    while (1) {
+        int new_val = gpio_pin_get_dt(&button);
+        if (val != new_val) {
+            val = new_val;
+            if (val >= 0) {
+                if (val == 1) {
+                    // report.button = 0x04;
+                    // report.hat = 0x06;
+                    report.lx = 0;
+                } else {
+                    // report.button = 0;
+                    // report.hat = 0x08;
+                    report.lx = 128;
+                }
+                gpio_pin_set_dt(&led, val);
+                hid_int_ep_write(hdev, (uint8_t *)&report, sizeof(report), &wrote);
+            }
+        }
+        k_msleep(20);
+    }
 }
 
 static int composite_pre_init(const struct device *dev)
@@ -163,7 +235,6 @@ static int composite_pre_init(const struct device *dev)
 				&ops);
 
 	atomic_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
-	k_timer_start(&event_timer, REPORT_PERIOD, REPORT_PERIOD);
 
 	if (usb_hid_set_proto_code(hdev, HID_BOOT_IFACE_CODE_NONE)) {
 		LOG_WRN("Failed to set Protocol Code");
