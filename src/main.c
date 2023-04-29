@@ -25,6 +25,8 @@ LOG_MODULE_REGISTER(main);
 K_MSGQ_DEFINE(uart_msgq, MSG_SIZE, 100, 4);
 
 static const struct device *uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
+static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 
 /* receive buffer used in UART ISR callback */
 static char rx_buf[MSG_SIZE];
@@ -146,7 +148,7 @@ void serial_cb(const struct device *dev, void *user_data)
 		rx_buf_pos = (rx_buf_pos + 1) % MSG_SIZE;
 
 		if (rx_buf_pos == 0) {
-			k_msgq_put(&uart_msgq, &rx_buf, K_NO_WAIT);
+			k_msgq_put(&uart_msgq, &rx_buf, K_FOREVER);
 		}
 	}
 }
@@ -158,6 +160,28 @@ void print_uart(char *buf)
 	for (int i = 0; i < msg_len; i++) {
 		uart_poll_out(uart_dev, buf[i]);
 	}
+}
+
+void send_report(uint8_t *buf)
+{
+	int ret;
+	int wrote;
+
+	gpio_pin_toggle_dt(&led);
+	k_sem_take(&hid_sem, K_MSEC(30));
+	ret = hid_int_ep_write(hdev, buf, sizeof(struct joystick_report), &wrote);
+	if (ret != 0) {
+		LOG_ERR("Failed to write hid event");
+		k_sem_give(&hid_sem);
+	}
+}
+
+void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	uint8_t buf[MSG_SIZE] = { 0x04, 0x00, 0x08, 128, 128, 128, 128 };
+	k_msgq_put(&uart_msgq, &buf, K_NO_WAIT);
+	buf[0] = 0;
+	k_msgq_put(&uart_msgq, &buf, K_NO_WAIT);
 }
 
 void main(void)
@@ -181,7 +205,21 @@ void main(void)
 		return;
 	}
 
-	static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+	ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
+	if (ret != 0) {
+		LOG_ERR("Failed to set button as input");
+		return;
+	}
+	static struct gpio_callback button_cb_data;
+	ret = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+	if (ret != 0) {
+		LOG_ERR("Failed to set button interrupt");
+		return;
+	}
+	LOG_INF("interrupt configured");
+	gpio_init_callback(&button_cb_data, button_pressed, BIT(button.pin));
+	gpio_add_callback(button.port, &button_cb_data);
+
 	if (!device_is_ready(led.port)) {
 		LOG_ERR("led gpio port is not ready\n");
 		return;
@@ -192,19 +230,12 @@ void main(void)
 		return;
 	}
 
-	int wrote;
 	// Add one more byte and set it as string end when debugging.
 	char tx_buf[MSG_SIZE + 1];
 	tx_buf[MSG_SIZE] = '\0';
-	while (k_msgq_get(&uart_msgq, &tx_buf, K_FOREVER) == 0) {
-		gpio_pin_toggle_dt(&led);
-		k_sem_take(&hid_sem, K_MSEC(30));
-		ret = hid_int_ep_write(hdev, (uint8_t *)tx_buf, sizeof(struct joystick_report),
-				       &wrote);
-		if (ret != 0) {
-			LOG_ERR("Failed to write hid event");
-			k_sem_give(&hid_sem);
-		}
+	while (1) {
+		k_msgq_get(&uart_msgq, &tx_buf, K_NO_WAIT);
+		send_report((uint8_t *)tx_buf);
 	}
 }
 
