@@ -8,6 +8,7 @@
 #include <zephyr.h>
 #include <init.h>
 #include <drivers/gpio.h>
+#include <drivers/uart.h>
 
 #include <usb/usb_device.h>
 #include <usb/class/usb_hid.h>
@@ -15,13 +16,25 @@
 #define LOG_LEVEL LOG_LEVEL_INF
 LOG_MODULE_REGISTER(main);
 
+/* change this to any other UART peripheral if desired */
+#define UART_DEVICE_NODE DT_CHOSEN(zephyr_shell_uart)
+
+#define MSG_SIZE 7
+
+/* queue to store up to 10 messages (aligned to 4-byte boundary) */
+K_MSGQ_DEFINE(uart_msgq, MSG_SIZE, 100, 4);
+
+static const struct device *uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
+
+/* receive buffer used in UART ISR callback */
+static char rx_buf[MSG_SIZE];
+static int rx_buf_pos = 0;
+
 static bool configured;
 static const struct device *hdev;
-static ATOMIC_DEFINE(hid_ep_in_busy, 1);
+static K_SEM_DEFINE(hid_sem, 1, 1);
 
-#define HID_EP_BUSY_FLAG	0
-
-static struct joystick_report {
+struct joystick_report {
 	uint16_t button;
 	uint8_t hat;
 	uint8_t lx;
@@ -29,22 +42,8 @@ static struct joystick_report {
 	uint8_t rx;
 	uint8_t ry;
     uint8_t vendor_specific;
-} report = {
-    .button = 0,
-    .hat = 0x08,
-    .lx = 128,
-    .ly = 128,
-    .rx = 128,
-    .ry = 128,
 };
 
-/*
- * Simple HID Report Descriptor
- * Report ID is present for completeness, although it can be omitted.
- * Output of "usbhid-dump -d 2fe3:0006 -e descriptor":
- *  05 01 09 00 A1 01 15 00    26 FF 00 85 01 75 08 95
- *  01 09 00 81 02 C0
- */
 static const uint8_t hid_report_desc[] = {
 	HID_USAGE_PAGE(HID_USAGE_GEN_DESKTOP),
 	HID_USAGE(HID_USAGE_GEN_DESKTOP_GAMEPAD),
@@ -89,36 +88,9 @@ static const uint8_t hid_report_desc[] = {
 	HID_END_COLLECTION,
 };
 
-/*
-static void send_report(struct k_work *work)
-{
-	int ret, wrote;
-
-	if (!atomic_test_and_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
-		ret = hid_int_ep_write(hdev, (uint8_t *)&report_1,
-				       sizeof(report_1), &wrote);
-		if (ret != 0) {
-			/*
-			 * Do nothing and wait until host has reset the device
-			 * and hid_ep_in_busy is cleared.
-			 */
-/*
-			LOG_ERR("Failed to submit report");
-		} else {
-			LOG_DBG("Report submitted");
-		}
-	} else {
-		LOG_DBG("HID IN endpoint busy");
-	}
-}
-*/
-
 static void int_in_ready_cb(const struct device *dev)
 {
 	ARG_UNUSED(dev);
-	if (!atomic_test_and_clear_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG)) {
-		LOG_WRN("IN endpoint callback without preceding buffer write");
-	}
 }
 
 /*
@@ -163,11 +135,45 @@ static void status_cb(enum usb_dc_status_code status, const uint8_t *param)
 	}
 }
 
+void serial_cb(const struct device *dev, void *user_data)
+{
+	if (!uart_irq_update(uart_dev)) {
+		return;
+	}
+
+	while (uart_irq_rx_ready(uart_dev)) {
+		uart_fifo_read(uart_dev, &rx_buf[rx_buf_pos], 1);
+		rx_buf_pos = (rx_buf_pos + 1) % MSG_SIZE;
+
+		if (rx_buf_pos == 0) {
+			k_msgq_put(&uart_msgq, &rx_buf, K_NO_WAIT);
+		}
+	}
+}
+
+void print_uart(char *buf)
+{
+	int msg_len = strlen(buf);
+
+	for (int i = 0; i < msg_len; i++) {
+		uart_poll_out(uart_dev, buf[i]);
+	}
+}
+
 void main(void)
 {
 	int ret;
 
 	LOG_INF("Starting application");
+
+	if (!device_is_ready(uart_dev)) {
+		LOG_ERR("UART device not found!");
+		return;
+	}
+
+	/* configure interrupt and callback to receive data */
+	uart_irq_callback_user_data_set(uart_dev, serial_cb, NULL);
+	uart_irq_rx_enable(uart_dev);
 
 	ret = usb_enable(status_cb);
 	if (ret != 0) {
@@ -175,50 +181,31 @@ void main(void)
 		return;
 	}
 
-    static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
-    if (!device_is_ready(button.port)) {
-        LOG_ERR("button gpio port is not ready\n");
-        return;
-    }
-    ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
-    if (ret != 0) {
-        LOG_ERR("Failed to configure btn as input\n");
-        return;
-    }
+	static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+	if (!device_is_ready(led.port)) {
+		LOG_ERR("led gpio port is not ready\n");
+		return;
+	}
+	ret = gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
+	if (ret != 0) {
+		LOG_ERR("Failed to configure led as output\n");
+		return;
+	}
 
-    static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
-    if (!device_is_ready(led.port)) {
-        LOG_ERR("led gpio port is not ready\n");
-        return;
-    }
-    ret = gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
-    if (ret != 0) {
-        LOG_ERR("Failed to configure led as output\n");
-        return;
-    }
-
-    int val = 0;
-    int wrote;
-    while (1) {
-        int new_val = gpio_pin_get_dt(&button);
-        if (val != new_val) {
-            val = new_val;
-            if (val >= 0) {
-                if (val == 1) {
-                    report.button = 0x04;
-                    // report.hat = 0x06;
-                    // report.lx = 0;
-                } else {
-                    report.button = 0;
-                    // report.hat = 0x08;
-                    // report.lx = 128;
-                }
-                gpio_pin_set_dt(&led, val);
-                hid_int_ep_write(hdev, (uint8_t *)&report, sizeof(report), &wrote);
-            }
-        }
-        k_msleep(20);
-    }
+	int wrote;
+	// Add one more byte and set it as string end when debugging.
+	char tx_buf[MSG_SIZE + 1];
+	tx_buf[MSG_SIZE] = '\0';
+	while (k_msgq_get(&uart_msgq, &tx_buf, K_FOREVER) == 0) {
+		gpio_pin_toggle_dt(&led);
+		k_sem_take(&hid_sem, K_MSEC(30));
+		ret = hid_int_ep_write(hdev, (uint8_t *)tx_buf, sizeof(struct joystick_report),
+				       &wrote);
+		if (ret != 0) {
+			LOG_ERR("Failed to write hid event");
+			k_sem_give(&hid_sem);
+		}
+	}
 }
 
 static int composite_pre_init(const struct device *dev)
@@ -233,12 +220,6 @@ static int composite_pre_init(const struct device *dev)
 
 	usb_hid_register_device(hdev, hid_report_desc, sizeof(hid_report_desc),
 				&ops);
-
-	atomic_set_bit(hid_ep_in_busy, HID_EP_BUSY_FLAG);
-
-	if (usb_hid_set_proto_code(hdev, HID_BOOT_IFACE_CODE_NONE)) {
-		LOG_WRN("Failed to set Protocol Code");
-	}
 
 	return usb_hid_init(hdev);
 }
