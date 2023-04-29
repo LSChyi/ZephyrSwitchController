@@ -205,13 +205,13 @@ void main(void)
             val = new_val;
             if (val >= 0) {
                 if (val == 1) {
-                    // report.button = 0x04;
+                    report.button = 0x04;
                     // report.hat = 0x06;
-                    report.lx = 0;
+                    // report.lx = 0;
                 } else {
-                    // report.button = 0;
+                    report.button = 0;
                     // report.hat = 0x08;
-                    report.lx = 128;
+                    // report.lx = 128;
                 }
                 gpio_pin_set_dt(&led, val);
                 hid_int_ep_write(hdev, (uint8_t *)&report, sizeof(report), &wrote);
